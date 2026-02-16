@@ -1,0 +1,4 @@
+# Feetech STS3215 servo motor USB adapter
+# Creates /dev/feetech symlink
+# Install: sudo cp 99-feetech.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", SYMLINK+="feetech", MODE="0666"

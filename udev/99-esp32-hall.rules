@@ -1,0 +1,4 @@
+# ESP32-C3 hall sensor for rotating LiDAR
+# Creates /dev/esp32_hall symlink
+# Install: sudo cp 99-esp32-hall.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="esp32_hall", MODE="0666"

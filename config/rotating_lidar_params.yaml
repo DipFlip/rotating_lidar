@@ -1,0 +1,14 @@
+motor_controller_node:
+  ros__parameters:
+    port: /dev/feetech
+    servo_id: 7
+    spin_speed: 2000
+    gear_ratio: 1.3333  # 24 motor teeth / 18 lidar teeth
+    baudrate: 1000000
+    position_read_rate: 50.0
+
+hall_sensor_node:
+  ros__parameters:
+    port: /dev/esp32_hall
+    baudrate: 115200
+    reconnect_interval: 2.0
