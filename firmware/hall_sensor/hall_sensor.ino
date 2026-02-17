@@ -1,47 +1,64 @@
 /**
- * Hall sensor firmware for ESP32-C3.
+ * Hall sensor firmware for ESP32-C3 — rotating LiDAR zero-reference.
  *
- * Detects magnet passes on a rotating LiDAR mount and outputs structured
- * serial data for the ROS2 hall_sensor_node to parse.
+ * The hall sensor module has a digital output (DO) with built-in
+ * comparator and LED indicator.  DO goes LOW when the magnet is
+ * detected.  Connected to GPIO 4.
  *
- * Output format: H,<count>,<millis>
- *   count  - cumulative number of magnet passes since boot
- *   millis - ESP32 uptime in milliseconds at detection time
+ * Polls digitalRead at 10 kHz.  On each falling edge (HIGH->LOW),
+ * outputs:  H,<count>,<millis>
  *
- * Debounce is applied to avoid double-counting on noisy transitions.
+ * A heartbeat line is printed every second:  B,<pin_state>,<millis>
+ *
+ * Compile with:  --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc
  */
 
-#define HALL_PIN 2     // GPIO connected to hall sensor output
-#define DEBOUNCE_MS 50 // Minimum time between triggers
+#define HALL_PIN 4
 
-volatile unsigned long lastTriggerMs = 0;
-volatile int triggerCount = 0;
-volatile bool newTrigger = false;
+// Minimum interval between triggers (ms) — debounce.
+#define MIN_TRIGGER_INTERVAL_MS 200
 
-void IRAM_ATTR hallISR() {
-  unsigned long now = millis();
-  if (now - lastTriggerMs >= DEBOUNCE_MS) {
-    lastTriggerMs = now;
-    triggerCount++;
-    newTrigger = true;
-  }
-}
+// Heartbeat interval (ms)
+#define HEARTBEAT_INTERVAL_MS 1000
+
+static unsigned long trigger_count = 0;
+static unsigned long last_trigger_ms = 0;
+static unsigned long last_heartbeat_ms = 0;
+static int last_pin = HIGH;
 
 void setup() {
   Serial.begin(115200);
   pinMode(HALL_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
+  delay(500);
+  last_pin = digitalRead(HALL_PIN);
   Serial.println("H,0,0");
 }
 
 void loop() {
-  if (newTrigger) {
-    newTrigger = false;
-    // Output structured line: H,<count>,<millis>
-    Serial.print("H,");
-    Serial.print(triggerCount);
-    Serial.print(",");
-    Serial.println(lastTriggerMs);
+  int pin = digitalRead(HALL_PIN);
+  unsigned long now = millis();
+
+  // Detect falling edge (HIGH -> LOW = magnet arriving)
+  if (pin == LOW && last_pin == HIGH) {
+    if (now - last_trigger_ms >= MIN_TRIGGER_INTERVAL_MS) {
+      trigger_count++;
+      last_trigger_ms = now;
+      Serial.print("H,");
+      Serial.print(trigger_count);
+      Serial.print(",");
+      Serial.println(now);
+    }
   }
-  delay(1);
+  last_pin = pin;
+
+  // Heartbeat
+  if (now - last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS) {
+    last_heartbeat_ms = now;
+    Serial.print("B,");
+    Serial.print(pin);
+    Serial.print(",");
+    Serial.println(now);
+  }
+
+  delayMicroseconds(100);  // 10 kHz polling
 }

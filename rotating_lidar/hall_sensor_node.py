@@ -6,6 +6,11 @@ each pass of the LiDAR through its reference (horizontal) orientation.
 Publishes a trigger message on each magnet pass for motor angle correction.
 
 Expected ESP32 serial format: H,<count>,<millis>
+
+The ESP32's millis timestamp is used to reconstruct accurate ROS timestamps,
+avoiding jitter from Python timer polling under CPU load. A clock offset
+between ESP32 uptime and ROS time is established on the first message and
+updated on each subsequent message to track clock drift.
 """
 
 import serial
@@ -36,6 +41,9 @@ class HallSensorNode(Node):
         self.last_count = -1
         self.reconnect_timer = None
 
+        # Clock synchronisation: ros_time = esp32_sec + clock_offset
+        self.clock_offset = None
+
         # Try initial connection
         self._connect_serial()
 
@@ -52,7 +60,14 @@ class HallSensorNode(Node):
                 baudrate=self.baudrate,
                 timeout=0.01,
             )
+            # ESP32-C3 resets on serial open (DTR). Wait for boot and
+            # flush ROM output so we only parse firmware messages.
+            import time
+            time.sleep(1.0)
+            self.serial_conn.reset_input_buffer()
             self.get_logger().info(f'Serial connected: {self.port}')
+            # Reset clock sync on reconnect
+            self.clock_offset = None
             # Cancel reconnect timer if active
             if self.reconnect_timer is not None:
                 self.reconnect_timer.cancel()
@@ -71,6 +86,26 @@ class HallSensorNode(Node):
         if self.serial_conn is None:
             self._connect_serial()
 
+    def _esp32_to_ros_time(self, esp32_millis):
+        """Convert ESP32 millis to ROS time using tracked clock offset.
+
+        On first call, establishes the offset. On subsequent calls, uses
+        a simple low-pass update so the offset tracks any long-term drift
+        between the ESP32 crystal and system clock without being affected
+        by single-message jitter.
+        """
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        esp32_sec = esp32_millis * 0.001
+
+        if self.clock_offset is None:
+            self.clock_offset = now_sec - esp32_sec
+        else:
+            # Slowly track drift (alpha=0.01 → time constant ~100 messages)
+            new_offset = now_sec - esp32_sec
+            self.clock_offset += 0.01 * (new_offset - self.clock_offset)
+
+        return esp32_sec + self.clock_offset
+
     def read_serial_callback(self):
         """Read and parse serial data from ESP32."""
         if self.serial_conn is None:
@@ -84,41 +119,30 @@ class HallSensorNode(Node):
             if not line:
                 return
 
-            # Parse structured format: H,<count>,<millis>
-            if line.startswith('H,'):
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    try:
-                        count = int(parts[1])
-                    except ValueError:
-                        return
+            # Parse format: H,<count>,<millis>
+            if not line.startswith('H,'):
+                return
+            parts = line.split(',')
+            if len(parts) < 3:
+                return
+            try:
+                count = int(parts[1])
+                esp32_millis = int(parts[2])
+            except ValueError:
+                return
 
-                    # Publish on count increment (new magnet pass)
-                    if count != self.last_count:
-                        self.last_count = count
-                        msg = Header()
-                        msg.stamp = self.get_clock().now().to_msg()
-                        msg.frame_id = 'hall_sensor'
-                        self.trigger_pub.publish(msg)
-                        self.get_logger().debug(f'Hall trigger: count={count}')
+            if count != self.last_count:
+                self.last_count = count
+                trigger_sec = self._esp32_to_ros_time(esp32_millis)
+                sec = int(trigger_sec)
+                nanosec = int((trigger_sec - sec) * 1e9)
 
-            # Also handle legacy format: count=N pin=LOW/HIGH
-            elif line.startswith('count='):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('count='):
-                        try:
-                            count = int(part.split('=')[1])
-                        except (ValueError, IndexError):
-                            continue
-
-                        if count != self.last_count:
-                            self.last_count = count
-                            msg = Header()
-                            msg.stamp = self.get_clock().now().to_msg()
-                            msg.frame_id = 'hall_sensor'
-                            self.trigger_pub.publish(msg)
-                            self.get_logger().debug(f'Hall trigger (legacy): count={count}')
+                msg = Header()
+                msg.stamp.sec = sec
+                msg.stamp.nanosec = nanosec
+                msg.frame_id = 'hall_sensor'
+                self.trigger_pub.publish(msg)
+                self.get_logger().debug(f'Hall trigger: count={count}')
 
         except serial.SerialException as e:
             self.get_logger().warn(f'Serial read error: {e}')

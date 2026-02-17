@@ -20,7 +20,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64, Header
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger, SetBool
 
 try:
@@ -80,8 +80,6 @@ class MotorControllerNode(Node):
         self.motor_deg_per_lidar_rev = 360.0 / self.gear_ratio
 
         # Publishers
-        self.motor_angle_pub = self.create_publisher(Float64, '/rotating_lidar/motor_angle', 10)
-        self.lidar_angle_pub = self.create_publisher(Float64, '/rotating_lidar/lidar_angle', 10)
         self.joint_state_pub = self.create_publisher(JointState, '/joint_states', 10)
 
         # Services
@@ -103,8 +101,8 @@ class MotorControllerNode(Node):
         self.cal_samples = []
         # golden_zero: motor position (mod motor_deg_per_lidar_rev) where hall fires
         self.golden_zero = 0.0
-        # hall_motor_ref: cumulative motor angle at last hall trigger
-        self.hall_motor_ref = 0.0
+        # cal_offset_deg: constant offset so that lidar_angle = cumulative * gear_ratio + cal_offset_deg
+        self.cal_offset_deg = 0.0
         self.last_hall_motor_deg = None  # for debounce
 
         # Serial
@@ -183,10 +181,12 @@ class MotorControllerNode(Node):
         """Enter calibration state."""
         self.cal_state = 'CALIBRATING'
         self.cal_samples = []
-        self.cal_skip_first = True  # skip first hall trigger (motor still spinning up)
+        # Skip first few triggers while the motor spins up to steady speed.
+        # At ~1.6s per trigger, 5 skips ≈ 8s of spin-up time.
+        self.cal_skip_remaining = 5
         self.get_logger().info(
-            f'Calibration started: skipping first trigger, then collecting '
-            f'{CALIBRATION_SAMPLES} hall triggers...'
+            f'Calibration started: skipping {self.cal_skip_remaining} triggers for spin-up, '
+            f'then collecting {CALIBRATION_SAMPLES} hall triggers...'
         )
 
     def start_motor_callback(self, request, response):
@@ -254,9 +254,13 @@ class MotorControllerNode(Node):
         return response
 
     def read_position_callback(self):
-        """Read motor position and publish angles."""
+        """Read motor position and publish angle via JointState."""
         if self.port_handler is None or self.packet_handler is None:
             return
+
+        # Timestamp before serial read — captures when the motor is at
+        # this position, not when the USB response arrives
+        stamp = self.get_clock().now().to_msg()
 
         position, result, error = self.packet_handler.read2ByteTxRx(
             self.port_handler, self.servo_id, ADDR_SCS_PRESENT_POSITION
@@ -276,36 +280,17 @@ class MotorControllerNode(Node):
             self.cumulative_angle_deg += delta
         self.last_raw_position = raw_angle_deg
 
-        # Publish raw motor angle (degrees)
-        motor_msg = Float64()
-        motor_msg.data = self.cumulative_angle_deg
-        self.motor_angle_pub.publish(motor_msg)
-
-        # Compute LiDAR angle relative to calibrated horizontal
+        # Compute LiDAR angle — continuous (no normalization) so the
+        # rotator's linear fit sees a smooth monotonic signal
         if self.cal_state == 'CALIBRATED':
-            # Motor degrees since last hall trigger
-            motor_since_hall = self.cumulative_angle_deg - self.hall_motor_ref
-            # Convert to lidar degrees within one revolution
-            lidar_angle_deg = (motor_since_hall % self.motor_deg_per_lidar_rev) \
-                / self.motor_deg_per_lidar_rev * 360.0
-            # At the hall trigger (motor_since_hall=0), lidar is at hall_offset_deg
-            lidar_angle_deg = lidar_angle_deg + self.hall_offset_deg
-            # Normalize to [-180, +180]
-            lidar_angle_deg = lidar_angle_deg % 360.0
-            if lidar_angle_deg > 180.0:
-                lidar_angle_deg -= 360.0
+            lidar_angle_deg = self.cumulative_angle_deg * self.gear_ratio + self.cal_offset_deg
         else:
-            lidar_angle_deg = (self.cumulative_angle_deg * self.gear_ratio) % 360.0
+            lidar_angle_deg = self.cumulative_angle_deg * self.gear_ratio
 
         lidar_angle_rad = math.radians(lidar_angle_deg)
 
-        lidar_msg = Float64()
-        lidar_msg.data = lidar_angle_rad
-        self.lidar_angle_pub.publish(lidar_msg)
-
-        # Publish JointState for robot_state_publisher (drives URDF continuous joint)
         js = JointState()
-        js.header.stamp = self.get_clock().now().to_msg()
+        js.header.stamp = stamp
         js.name = ['plank_to_lidar']
         js.position = [lidar_angle_rad]
         self.joint_state_pub.publish(js)
@@ -317,8 +302,11 @@ class MotorControllerNode(Node):
 
         motor_deg = self.cumulative_angle_deg
 
-        # Debounce: ignore triggers less than half a lidar revolution apart
-        min_motor_spacing = self.motor_deg_per_lidar_rev * 0.5
+        # Debounce: ignore triggers less than 3/4 of a lidar revolution apart.
+        # The shaft has two magnets ~180 lidar-degrees apart (=~135 motor-degrees),
+        # so 0.75 * 270 = 202.5 motor-degrees rejects the second magnet while
+        # accepting every primary trigger (~270 motor-degrees apart).
+        min_motor_spacing = self.motor_deg_per_lidar_rev * 0.75
         if self.last_hall_motor_deg is not None:
             if motor_deg - self.last_hall_motor_deg < min_motor_spacing:
                 self.get_logger().debug(
@@ -332,10 +320,11 @@ class MotorControllerNode(Node):
         residual = motor_deg % self.motor_deg_per_lidar_rev
 
         if self.cal_state == 'CALIBRATING':
-            if self.cal_skip_first:
-                self.cal_skip_first = False
+            if self.cal_skip_remaining > 0:
+                self.cal_skip_remaining -= 1
                 self.get_logger().info(
-                    f'Calibration: skipped first trigger (motor_angle={motor_deg:.1f})'
+                    f'Calibration: skipped trigger ({self.cal_skip_remaining} remaining, '
+                    f'motor_angle={motor_deg:.1f})'
                 )
                 return
 
@@ -351,29 +340,23 @@ class MotorControllerNode(Node):
                 self._finish_calibration(motor_deg)
 
         elif self.cal_state == 'CALIBRATED':
-            # Update reference on every hall trigger to prevent drift
-            self.hall_motor_ref = motor_deg
-
-            # Watchdog: check residual vs golden zero
+            # Watchdog only — log drift but don't reset reference
             error = residual - self.golden_zero
-            # Normalize to [-half_period, +half_period]
             half_period = self.motor_deg_per_lidar_rev / 2.0
             if error > half_period:
                 error -= self.motor_deg_per_lidar_rev
             elif error < -half_period:
                 error += self.motor_deg_per_lidar_rev
-            # Convert to lidar degrees
             error_lidar = error * self.gear_ratio
 
             if abs(error_lidar) > HALL_WATCHDOG_THRESHOLD_DEG:
                 self.get_logger().warn(
-                    f'Hall watchdog: error={error_lidar:.1f} deg exceeds '
-                    f'{HALL_WATCHDOG_THRESHOLD_DEG} deg threshold. Recalibrating...'
+                    f'Hall watchdog: drift={error_lidar:.1f} deg exceeds '
+                    f'{HALL_WATCHDOG_THRESHOLD_DEG} deg threshold'
                 )
-                self._begin_calibration()
             else:
                 self.get_logger().debug(
-                    f'Hall watchdog OK: error={error_lidar:.1f} deg'
+                    f'Hall watchdog OK: drift={error_lidar:.1f} deg'
                 )
 
     def _finish_calibration(self, last_motor_deg):
@@ -413,8 +396,10 @@ class MotorControllerNode(Node):
             deviations.append(dev)
         dev_str = ', '.join(f'{d:+.1f}' for d in deviations)
 
-        # Set reference to the most recent hall trigger
-        self.hall_motor_ref = last_motor_deg
+        # Compute constant offset: at the last hall trigger, the lidar angle
+        # should be hall_offset_deg. So:
+        #   hall_offset_deg = last_motor_deg * gear_ratio + cal_offset_deg
+        self.cal_offset_deg = self.hall_offset_deg - last_motor_deg * self.gear_ratio
 
         self.cal_state = 'CALIBRATED'
         self.get_logger().info(
@@ -452,10 +437,8 @@ class MotorControllerNode(Node):
                 cumulative += delta
             last_raw = raw_deg
 
-            # Compute lidar angle from hall reference
-            motor_since_hall = cumulative - self.hall_motor_ref
-            lidar_deg = (motor_since_hall % period) / period * 360.0 + self.hall_offset_deg
-            lidar_deg = lidar_deg % 360.0
+            # Compute lidar angle using calibration offset
+            lidar_deg = (cumulative * self.gear_ratio + self.cal_offset_deg) % 360.0
 
             # Stop when lidar angle is near 0 (horizontal)
             # Check proximity to 0 (i.e. lidar_deg near 0 or near 360)
