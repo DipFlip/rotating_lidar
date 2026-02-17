@@ -3,9 +3,10 @@ motor_controller_node:
     port: /dev/feetech
     servo_id: 7
     spin_speed: 2000
-    gear_ratio: 1.3333  # 24 motor teeth / 18 lidar teeth
+    gear_ratio: 1.3333333333  # 24 motor teeth / 18 lidar shaft teeth (= 4/3)
     baudrate: 1000000
     position_read_rate: 50.0
+    hall_offset_deg: 25.0  # lidar angle (deg) when hall sensor triggers
 
 hall_sensor_node:
   ros__parameters:

@@ -26,7 +26,7 @@ def generate_launch_description():
         executable='motor_controller_node.py',
         name='motor_controller_node',
         output='screen',
-        parameters=[config],
+        parameters=[config, {'auto_start': LaunchConfiguration('auto_start_motor')}],
     )
 
     hall_sensor = Node(

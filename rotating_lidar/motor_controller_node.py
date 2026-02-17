@@ -5,17 +5,21 @@ Controls the servo motor that rotates the VLP-16 LiDAR around a horizontal axis.
 Reads motor position register at ~50Hz, computes LiDAR angle via gear ratio,
 and publishes both raw motor angle and derived LiDAR angle.
 
-Calibration: On start_motor, spins for 10 revolutions while recording the motor
-position at each hall sensor trigger. The average gives the motor position that
-corresponds to LiDAR horizontal (angle=0). After calibration, only the motor
-register is used for angle computation. The hall sensor acts as a watchdog —
-if it triggers more than 30 degrees from expected horizontal, recalibration runs.
+Calibration: On start_motor, collects 10 hall sensor triggers and records the
+cumulative motor angle at each. The residuals (motor_angle mod motor_period)
+are averaged to find the "golden zero" — the motor position within one lidar
+revolution where the hall fires. From the golden zero and the hall_offset_deg
+parameter, horizontal (lidar_angle=0) is computed. The reference is updated on
+every subsequent hall trigger to prevent drift.
 """
 
 import math
+import signal
+import time
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Header
 from std_srvs.srv import Trigger, SetBool
 
@@ -32,19 +36,21 @@ except ImportError:
 
 # STS3215 control table addresses
 ADDR_SCS_TORQUE_ENABLE = 40
+ADDR_SCS_GOAL_POSITION = 42
 ADDR_SCS_GOAL_SPEED = 46
 ADDR_SCS_PRESENT_POSITION = 56
 ADDR_SCS_MODE = 33
 
 SCS_PROTOCOL_VERSION = 0
+MODE_POSITION = 0
 MODE_WHEEL = 1
 
 POSITION_STEPS = 4096
 DEGREES_PER_STEP = 360.0 / POSITION_STEPS
 
 # Calibration constants
-CALIBRATION_REVOLUTIONS = 10
-HALL_WATCHDOG_THRESHOLD_DEG = 30.0
+CALIBRATION_SAMPLES = 10
+HALL_WATCHDOG_THRESHOLD_DEG = 60.0
 
 
 class MotorControllerNode(Node):
@@ -55,9 +61,11 @@ class MotorControllerNode(Node):
         self.declare_parameter('port', '/dev/feetech')
         self.declare_parameter('servo_id', 7)
         self.declare_parameter('spin_speed', 2000)
-        self.declare_parameter('gear_ratio', 1.3333)  # motor_teeth / lidar_teeth (24/18)
+        self.declare_parameter('gear_ratio', 1.3333333333)  # 24 motor teeth / 18 lidar shaft teeth
         self.declare_parameter('baudrate', 1000000)
         self.declare_parameter('position_read_rate', 50.0)
+        self.declare_parameter('auto_start', False)
+        self.declare_parameter('hall_offset_deg', 30.0)  # lidar angle (deg) at hall trigger
 
         # Get parameters
         self.port = self.get_parameter('port').value
@@ -66,10 +74,15 @@ class MotorControllerNode(Node):
         self.gear_ratio = self.get_parameter('gear_ratio').value
         self.baudrate = self.get_parameter('baudrate').value
         self.position_read_rate = self.get_parameter('position_read_rate').value
+        self.hall_offset_deg = self.get_parameter('hall_offset_deg').value
+
+        # Derived constant: motor degrees per full lidar revolution
+        self.motor_deg_per_lidar_rev = 360.0 / self.gear_ratio
 
         # Publishers
         self.motor_angle_pub = self.create_publisher(Float64, '/rotating_lidar/motor_angle', 10)
         self.lidar_angle_pub = self.create_publisher(Float64, '/rotating_lidar/lidar_angle', 10)
+        self.joint_state_pub = self.create_publisher(JointState, '/joint_states', 10)
 
         # Services
         self.create_service(Trigger, '~/start_motor', self.start_motor_callback)
@@ -86,13 +99,13 @@ class MotorControllerNode(Node):
         self.last_raw_position = None
 
         # Calibration state
-        # UNCALIBRATED: no reference, lidar_angle published as raw (no offset)
-        # CALIBRATING: collecting hall trigger motor positions
-        # CALIBRATED: horizontal_motor_deg is known, used as zero reference
         self.cal_state = 'UNCALIBRATED'
-        self.horizontal_motor_deg = 0.0  # Motor position (cumulative deg) at LiDAR horizontal
-        self.cal_samples = []  # Motor positions at hall triggers during calibration
-        self.cal_start_angle = 0.0  # Motor angle when calibration started
+        self.cal_samples = []
+        # golden_zero: motor position (mod motor_deg_per_lidar_rev) where hall fires
+        self.golden_zero = 0.0
+        # hall_motor_ref: cumulative motor angle at last hall trigger
+        self.hall_motor_ref = 0.0
+        self.last_hall_motor_deg = None  # for debounce
 
         # Serial
         self.port_handler = None
@@ -104,8 +117,18 @@ class MotorControllerNode(Node):
 
         self.get_logger().info(
             f'Motor controller initialized: port={self.port}, id={self.servo_id}, '
-            f'gear_ratio={self.gear_ratio}'
+            f'gear_ratio={self.gear_ratio}, '
+            f'motor_deg_per_lidar_rev={self.motor_deg_per_lidar_rev:.1f}'
         )
+
+        # Auto-start motor if configured
+        if self.get_parameter('auto_start').value:
+            success, message = self._start_spinning()
+            if success:
+                self._begin_calibration()
+                self.get_logger().info(f'Auto-start: {message}. Calibrating...')
+            else:
+                self.get_logger().error(f'Auto-start failed: {message}')
 
     def _init_serial(self):
         """Initialize serial connection to Feetech servo."""
@@ -160,9 +183,10 @@ class MotorControllerNode(Node):
         """Enter calibration state."""
         self.cal_state = 'CALIBRATING'
         self.cal_samples = []
-        self.cal_start_angle = self.cumulative_angle_deg
+        self.cal_skip_first = True  # skip first hall trigger (motor still spinning up)
         self.get_logger().info(
-            f'Calibration started: collecting {CALIBRATION_REVOLUTIONS} hall triggers...'
+            f'Calibration started: skipping first trigger, then collecting '
+            f'{CALIBRATION_SAMPLES} hall triggers...'
         )
 
     def start_motor_callback(self, request, response):
@@ -175,7 +199,7 @@ class MotorControllerNode(Node):
 
         self._begin_calibration()
         response.success = True
-        response.message = f'{message}. Calibrating over {CALIBRATION_REVOLUTIONS} revolutions...'
+        response.message = f'{message}. Calibrating over {CALIBRATION_SAMPLES} triggers...'
         self.get_logger().info(response.message)
         return response
 
@@ -188,7 +212,7 @@ class MotorControllerNode(Node):
 
         self._begin_calibration()
         response.success = True
-        response.message = f'Recalibration started: collecting {CALIBRATION_REVOLUTIONS} hall triggers...'
+        response.message = f'Recalibration started: collecting {CALIBRATION_SAMPLES} hall triggers...'
         return response
 
     def stop_motor_callback(self, request, response):
@@ -258,12 +282,20 @@ class MotorControllerNode(Node):
         self.motor_angle_pub.publish(motor_msg)
 
         # Compute LiDAR angle relative to calibrated horizontal
-        # lidar_angle = (motor_angle - horizontal_ref) * gear_ratio, in radians
         if self.cal_state == 'CALIBRATED':
-            lidar_angle_deg = (self.cumulative_angle_deg - self.horizontal_motor_deg) * self.gear_ratio
+            # Motor degrees since last hall trigger
+            motor_since_hall = self.cumulative_angle_deg - self.hall_motor_ref
+            # Convert to lidar degrees within one revolution
+            lidar_angle_deg = (motor_since_hall % self.motor_deg_per_lidar_rev) \
+                / self.motor_deg_per_lidar_rev * 360.0
+            # At the hall trigger (motor_since_hall=0), lidar is at hall_offset_deg
+            lidar_angle_deg = lidar_angle_deg + self.hall_offset_deg
+            # Normalize to [-180, +180]
+            lidar_angle_deg = lidar_angle_deg % 360.0
+            if lidar_angle_deg > 180.0:
+                lidar_angle_deg -= 360.0
         else:
-            # Before calibration, publish raw angle (no horizontal reference)
-            lidar_angle_deg = self.cumulative_angle_deg * self.gear_ratio
+            lidar_angle_deg = (self.cumulative_angle_deg * self.gear_ratio) % 360.0
 
         lidar_angle_rad = math.radians(lidar_angle_deg)
 
@@ -271,87 +303,192 @@ class MotorControllerNode(Node):
         lidar_msg.data = lidar_angle_rad
         self.lidar_angle_pub.publish(lidar_msg)
 
+        # Publish JointState for robot_state_publisher (drives URDF continuous joint)
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name = ['plank_to_lidar']
+        js.position = [lidar_angle_rad]
+        self.joint_state_pub.publish(js)
+
     def hall_trigger_callback(self, msg):
         """Handle hall sensor trigger."""
         if self.last_raw_position is None:
             return
 
+        motor_deg = self.cumulative_angle_deg
+
+        # Debounce: ignore triggers less than half a lidar revolution apart
+        min_motor_spacing = self.motor_deg_per_lidar_rev * 0.5
+        if self.last_hall_motor_deg is not None:
+            if motor_deg - self.last_hall_motor_deg < min_motor_spacing:
+                self.get_logger().debug(
+                    f'Hall debounce: ignoring trigger at {motor_deg:.1f} deg '
+                    f'(only {motor_deg - self.last_hall_motor_deg:.1f} deg from last)'
+                )
+                return
+        self.last_hall_motor_deg = motor_deg
+
+        # Motor position within one lidar revolution
+        residual = motor_deg % self.motor_deg_per_lidar_rev
+
         if self.cal_state == 'CALIBRATING':
-            self.cal_samples.append(self.cumulative_angle_deg)
+            if self.cal_skip_first:
+                self.cal_skip_first = False
+                self.get_logger().info(
+                    f'Calibration: skipped first trigger (motor_angle={motor_deg:.1f})'
+                )
+                return
+
+            self.cal_samples.append(residual)
             n = len(self.cal_samples)
             self.get_logger().info(
-                f'Calibration sample {n}/{CALIBRATION_REVOLUTIONS}: '
-                f'motor_angle={self.cumulative_angle_deg:.1f} deg'
+                f'Calibration sample {n}/{CALIBRATION_SAMPLES}: '
+                f'motor_angle={motor_deg:.1f}, '
+                f'residual={residual:.1f} deg (mod {self.motor_deg_per_lidar_rev:.1f})'
             )
 
-            if n >= CALIBRATION_REVOLUTIONS:
-                self._finish_calibration()
+            if n >= CALIBRATION_SAMPLES:
+                self._finish_calibration(motor_deg)
 
         elif self.cal_state == 'CALIBRATED':
-            # Watchdog: check if hall trigger is near expected horizontal
-            motor_deg_since_horizontal = self.cumulative_angle_deg - self.horizontal_motor_deg
-            # Expected: hall fires at multiples of (360 / gear_ratio) motor degrees
-            motor_deg_per_lidar_rev = 360.0 / self.gear_ratio
-            remainder = motor_deg_since_horizontal % motor_deg_per_lidar_rev
-            # Normalize to [-half, +half]
-            if remainder > motor_deg_per_lidar_rev / 2:
-                remainder -= motor_deg_per_lidar_rev
-            error_lidar_deg = remainder * self.gear_ratio
+            # Update reference on every hall trigger to prevent drift
+            self.hall_motor_ref = motor_deg
 
-            if abs(error_lidar_deg) > HALL_WATCHDOG_THRESHOLD_DEG:
+            # Watchdog: check residual vs golden zero
+            error = residual - self.golden_zero
+            # Normalize to [-half_period, +half_period]
+            half_period = self.motor_deg_per_lidar_rev / 2.0
+            if error > half_period:
+                error -= self.motor_deg_per_lidar_rev
+            elif error < -half_period:
+                error += self.motor_deg_per_lidar_rev
+            # Convert to lidar degrees
+            error_lidar = error * self.gear_ratio
+
+            if abs(error_lidar) > HALL_WATCHDOG_THRESHOLD_DEG:
                 self.get_logger().warn(
-                    f'Hall watchdog: error={error_lidar_deg:.1f} deg exceeds '
+                    f'Hall watchdog: error={error_lidar:.1f} deg exceeds '
                     f'{HALL_WATCHDOG_THRESHOLD_DEG} deg threshold. Recalibrating...'
                 )
                 self._begin_calibration()
             else:
                 self.get_logger().debug(
-                    f'Hall watchdog OK: error={error_lidar_deg:.1f} deg'
+                    f'Hall watchdog OK: error={error_lidar:.1f} deg'
                 )
 
-    def _finish_calibration(self):
-        """Compute horizontal reference from calibration samples."""
-        # Each sample is a cumulative motor angle at hall trigger.
-        # The spacing between samples should be ~(360/gear_ratio) motor degrees.
-        # Average the offset from the first sample modulo one lidar revolution.
-        motor_deg_per_lidar_rev = 360.0 / self.gear_ratio
+    def _finish_calibration(self, last_motor_deg):
+        """Compute golden zero from calibration residuals.
 
-        # Use circular mean to handle wraparound within one motor revolution period
+        Each residual is motor_angle % motor_deg_per_lidar_rev — the position
+        within one lidar revolution where the hall fired. Circular-average them
+        to get the golden zero. Log the per-sample deviations from the average.
+        """
+        period = self.motor_deg_per_lidar_rev
+
+        # Circular mean of residuals (handles wraparound near 0/period)
         sin_sum = 0.0
         cos_sum = 0.0
-        for sample in self.cal_samples:
-            phase = (sample % motor_deg_per_lidar_rev) * math.pi * 2.0 / motor_deg_per_lidar_rev
+        for r in self.cal_samples:
+            phase = r / period * 2.0 * math.pi
             sin_sum += math.sin(phase)
             cos_sum += math.cos(phase)
 
         avg_phase = math.atan2(sin_sum, cos_sum)
         if avg_phase < 0:
             avg_phase += 2.0 * math.pi
+        self.golden_zero = avg_phase / (2.0 * math.pi) * period
 
-        # Convert phase back to motor degrees within one period
-        horizontal_within_period = avg_phase * motor_deg_per_lidar_rev / (2.0 * math.pi)
+        # Consistency (R = 1.0 means all samples agree perfectly)
+        r = math.sqrt(sin_sum**2 + cos_sum**2) / len(self.cal_samples)
 
-        # Find the closest reference to current position
-        current_period = self.cumulative_angle_deg // motor_deg_per_lidar_rev
-        self.horizontal_motor_deg = current_period * motor_deg_per_lidar_rev + horizontal_within_period
+        # Log per-sample deviations from the golden zero
+        deviations = []
+        for res in self.cal_samples:
+            dev = res - self.golden_zero
+            half = period / 2.0
+            if dev > half:
+                dev -= period
+            elif dev < -half:
+                dev += period
+            deviations.append(dev)
+        dev_str = ', '.join(f'{d:+.1f}' for d in deviations)
+
+        # Set reference to the most recent hall trigger
+        self.hall_motor_ref = last_motor_deg
 
         self.cal_state = 'CALIBRATED'
         self.get_logger().info(
-            f'Calibration complete! horizontal_motor_deg={self.horizontal_motor_deg:.1f}, '
-            f'samples={len(self.cal_samples)}, '
-            f'motor_deg_per_lidar_rev={motor_deg_per_lidar_rev:.1f}'
+            f'Calibration complete! golden_zero={self.golden_zero:.1f} deg '
+            f'(mod {period:.1f}), '
+            f'hall_offset_deg={self.hall_offset_deg}, '
+            f'consistency={r:.3f}, '
+            f'deviations=[{dev_str}]'
         )
 
-    def destroy_node(self):
-        """Clean up serial connection on shutdown."""
-        if self.motor_running:
-            if self.port_handler and self.packet_handler:
+    def _return_to_horizontal(self):
+        """Keep spinning at normal speed, track lidar angle, stop at horizontal."""
+        self.get_logger().info('Returning to horizontal...')
+
+        period = self.motor_deg_per_lidar_rev
+        cumulative = self.cumulative_angle_deg
+        last_raw = self.last_raw_position
+
+        for _ in range(500):  # 10s at 50Hz
+            time.sleep(0.02)
+            position, result, error = self.packet_handler.read2ByteTxRx(
+                self.port_handler, self.servo_id, ADDR_SCS_PRESENT_POSITION
+            )
+            if result != COMM_SUCCESS:
+                continue
+
+            # Update cumulative angle (same logic as read_position_callback)
+            raw_deg = position * DEGREES_PER_STEP
+            if last_raw is not None:
+                delta = raw_deg - last_raw
+                if delta > 180.0:
+                    delta -= 360.0
+                elif delta < -180.0:
+                    delta += 360.0
+                cumulative += delta
+            last_raw = raw_deg
+
+            # Compute lidar angle from hall reference
+            motor_since_hall = cumulative - self.hall_motor_ref
+            lidar_deg = (motor_since_hall % period) / period * 360.0 + self.hall_offset_deg
+            lidar_deg = lidar_deg % 360.0
+
+            # Stop when lidar angle is near 0 (horizontal)
+            # Check proximity to 0 (i.e. lidar_deg near 0 or near 360)
+            if lidar_deg > 180.0:
+                lidar_deg -= 360.0
+            if abs(lidar_deg) < 15.0:
                 self.packet_handler.write2ByteTxRx(
                     self.port_handler, self.servo_id, ADDR_SCS_GOAL_SPEED, 0
                 )
-                self.packet_handler.write1ByteTxRx(
-                    self.port_handler, self.servo_id, ADDR_SCS_TORQUE_ENABLE, 0
+                self.get_logger().info(
+                    f'Reached horizontal position (lidar_angle={lidar_deg:.1f} deg)'
                 )
+                return
+
+        self.packet_handler.write2ByteTxRx(
+            self.port_handler, self.servo_id, ADDR_SCS_GOAL_SPEED, 0
+        )
+        self.get_logger().warn('Timed out waiting for horizontal position')
+
+    def destroy_node(self):
+        """Return to horizontal and clean up serial connection on shutdown."""
+        if self.motor_running and self.port_handler and self.packet_handler:
+            if self.cal_state == 'CALIBRATED':
+                try:
+                    self._return_to_horizontal()
+                except Exception as e:
+                    self.get_logger().warn(f'Failed to return to horizontal: {e}')
+
+            # Disable torque
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, self.servo_id, ADDR_SCS_TORQUE_ENABLE, 0
+            )
+
         if self.port_handler:
             self.port_handler.closePort()
         super().destroy_node()
@@ -360,13 +497,33 @@ class MotorControllerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MotorControllerNode()
+
+    shutdown_done = False
+
+    def shutdown():
+        nonlocal shutdown_done
+        if shutdown_done:
+            return
+        shutdown_done = True
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+    def sigterm_handler(signum, frame):
+        node.get_logger().info('SIGTERM received, shutting down...')
+        shutdown()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        shutdown()
 
 
 if __name__ == '__main__':
