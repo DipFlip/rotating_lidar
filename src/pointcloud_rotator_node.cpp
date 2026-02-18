@@ -39,10 +39,18 @@ public:
     this->declare_parameter<std::string>("joint_name", "plank_to_lidar");
     this->declare_parameter<double>("fit_window_sec", 5.0);
     this->declare_parameter<double>("max_stale_ms", 100.0);
+    this->declare_parameter<double>("rotation_axis_y", 0.0);
+    this->declare_parameter<double>("rotation_axis_z", -0.01);
+    this->declare_parameter<double>("yaw_correction_deg", 0.0);
 
     joint_name_ = this->get_parameter("joint_name").as_string();
     fit_window_sec_ = this->get_parameter("fit_window_sec").as_double();
     max_stale_ms_ = this->get_parameter("max_stale_ms").as_double();
+    rot_axis_y_ = this->get_parameter("rotation_axis_y").as_double();
+    rot_axis_z_ = this->get_parameter("rotation_axis_z").as_double();
+    double yaw_deg = this->get_parameter("yaw_correction_deg").as_double();
+    yaw_cos_ = std::cos(yaw_deg * M_PI / 180.0);
+    yaw_sin_ = std::sin(yaw_deg * M_PI / 180.0);
 
     // Subscriber for timestamped LiDAR angle via JointState
     angle_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
@@ -81,8 +89,9 @@ public:
       "/velodyne_points", rclcpp::SensorDataQoS());
 
     RCLCPP_INFO(this->get_logger(),
-      "Pointcloud rotator initialized (linear-fit, window=%.1fs, max_stale=%.0fms)",
-      fit_window_sec_, max_stale_ms_);
+      "Pointcloud rotator initialized (linear-fit, window=%.1fs, max_stale=%.0fms, "
+      "rot_axis_y=%.4f, rot_axis_z=%.4f, yaw_correction=%.2f deg)",
+      fit_window_sec_, max_stale_ms_, rot_axis_y_, rot_axis_z_, yaw_deg);
   }
 
 private:
@@ -191,20 +200,22 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!fit_.valid) {
-      cloud_pub_->publish(*msg);
+      // Don't publish until we have a valid angle fit (i.e. calibration done)
       return;
     }
 
     // Find field offsets
-    int y_offset = -1, z_offset = -1;
+    int x_offset = -1, y_offset = -1, z_offset = -1, time_offset = -1;
     for (const auto & field : msg->fields) {
-      if (field.name == "y") y_offset = field.offset;
+      if (field.name == "x") x_offset = field.offset;
+      else if (field.name == "y") y_offset = field.offset;
       else if (field.name == "z") z_offset = field.offset;
+      else if (field.name == "time") time_offset = field.offset;
     }
 
-    if (y_offset < 0 || z_offset < 0) {
+    if (x_offset < 0 || y_offset < 0 || z_offset < 0) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "PointCloud2 missing y/z fields");
+        "PointCloud2 missing x/y/z fields");
       cloud_pub_->publish(*msg);
       return;
     }
@@ -234,24 +245,45 @@ private:
 
     float cos_f = static_cast<float>(std::cos(angle));
     float sin_f = static_cast<float>(std::sin(angle));
+    float ay = static_cast<float>(rot_axis_y_);
+    float az = static_cast<float>(rot_axis_z_);
 
     auto output = std::make_shared<sensor_msgs::msg::PointCloud2>(*msg);
     const uint32_t point_step = output->point_step;
     const uint32_t num_points = output->width * output->height;
     uint8_t * data = output->data.data();
 
+    float yc = static_cast<float>(yaw_cos_);
+    float ys = static_cast<float>(yaw_sin_);
+
     for (uint32_t i = 0; i < num_points; ++i) {
       uint8_t * point_ptr = data + i * point_step;
 
-      float y, z;
+      float x, y, z;
+      std::memcpy(&x, point_ptr + x_offset, sizeof(float));
       std::memcpy(&y, point_ptr + y_offset, sizeof(float));
       std::memcpy(&z, point_ptr + z_offset, sizeof(float));
 
-      float y_new = y * cos_f - z * sin_f;
-      float z_new = y * sin_f + z * cos_f;
+      // Step 1: Rz yaw correction in sensor frame (corrects mounting yaw)
+      float x_yc = x * yc - y * ys;
+      float y_yc = x * ys + y * yc;
 
+      // Step 2: Rx rotation around the physical shaft axis
+      float dy = y_yc - ay;
+      float dz = z - az;
+      float y_new = dy * cos_f - dz * sin_f + ay;
+      float z_new = dy * sin_f + dz * cos_f + az;
+
+      std::memcpy(point_ptr + x_offset, &x_yc, sizeof(float));
       std::memcpy(point_ptr + y_offset, &y_new, sizeof(float));
       std::memcpy(point_ptr + z_offset, &z_new, sizeof(float));
+
+      // Zero per-point timestamps to avoid negative values that
+      // cause issues in Cartographer.
+      if (time_offset >= 0) {
+        float zero = 0.0f;
+        std::memcpy(point_ptr + time_offset, &zero, sizeof(float));
+      }
     }
 
     cloud_pub_->publish(*output);
@@ -260,6 +292,10 @@ private:
   std::string joint_name_;
   double fit_window_sec_;
   double max_stale_ms_;
+  double rot_axis_y_;
+  double rot_axis_z_;
+  double yaw_cos_;
+  double yaw_sin_;
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr angle_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;

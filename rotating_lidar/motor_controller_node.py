@@ -182,8 +182,8 @@ class MotorControllerNode(Node):
         self.cal_state = 'CALIBRATING'
         self.cal_samples = []
         # Skip first few triggers while the motor spins up to steady speed.
-        # At ~1.6s per trigger, 5 skips ≈ 8s of spin-up time.
-        self.cal_skip_remaining = 5
+        # At ~1.6s per trigger, 2 skips ≈ 3s of spin-up time.
+        self.cal_skip_remaining = 2
         self.get_logger().info(
             f'Calibration started: skipping {self.cal_skip_remaining} triggers for spin-up, '
             f'then collecting {CALIBRATION_SAMPLES} hall triggers...'
@@ -280,13 +280,13 @@ class MotorControllerNode(Node):
             self.cumulative_angle_deg += delta
         self.last_raw_position = raw_angle_deg
 
-        # Compute LiDAR angle — continuous (no normalization) so the
-        # rotator's linear fit sees a smooth monotonic signal
-        if self.cal_state == 'CALIBRATED':
-            lidar_angle_deg = self.cumulative_angle_deg * self.gear_ratio + self.cal_offset_deg
-        else:
-            lidar_angle_deg = self.cumulative_angle_deg * self.gear_ratio
+        # Only publish angles after calibration — this prevents the
+        # pointcloud rotator from publishing incorrectly rotated clouds
+        # during spin-up / calibration.
+        if self.cal_state != 'CALIBRATED':
+            return
 
+        lidar_angle_deg = self.cumulative_angle_deg * self.gear_ratio + self.cal_offset_deg
         lidar_angle_rad = math.radians(lidar_angle_deg)
 
         js = JointState()

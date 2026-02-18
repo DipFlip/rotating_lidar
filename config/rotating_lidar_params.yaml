@@ -6,7 +6,13 @@ motor_controller_node:
     gear_ratio: 1.3333333333  # 24 motor teeth / 18 lidar shaft teeth (= 4/3)
     baudrate: 1000000
     position_read_rate: 50.0
-    hall_offset_deg: 25.0  # lidar angle (deg) when hall sensor triggers
+    hall_offset_deg: 8.25  # lidar angle (deg) when hall sensor triggers
+
+pointcloud_rotator_node:
+  ros__parameters:
+    yaw_correction_deg: 2.25  # corrects VLP-16 yaw misalignment on shaft
+    rotation_axis_y: 0.0
+    rotation_axis_z: -0.01    # shaft axis is 1cm below sensor origin
 
 hall_sensor_node:
   ros__parameters:
