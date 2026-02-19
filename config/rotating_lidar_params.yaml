@@ -10,9 +10,10 @@ motor_controller_node:
 
 pointcloud_rotator_node:
   ros__parameters:
-    yaw_correction_deg: 2.25  # corrects VLP-16 yaw misalignment on shaft
+    yaw_correction_deg: 2.05    # corrects VLP-16 yaw misalignment on shaft
+    pitch_correction_deg: 0.0  # corrects VLP-16 pitch (forward/back tilt) on shaft
     rotation_axis_y: 0.0
-    rotation_axis_z: -0.01    # shaft axis is 1cm below sensor origin
+    rotation_axis_z: -0.01     # shaft axis is 1cm below sensor origin
 
 hall_sensor_node:
   ros__parameters:

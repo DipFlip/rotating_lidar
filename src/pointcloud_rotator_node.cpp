@@ -42,6 +42,7 @@ public:
     this->declare_parameter<double>("rotation_axis_y", 0.0);
     this->declare_parameter<double>("rotation_axis_z", -0.01);
     this->declare_parameter<double>("yaw_correction_deg", 0.0);
+    this->declare_parameter<double>("pitch_correction_deg", 0.0);
 
     joint_name_ = this->get_parameter("joint_name").as_string();
     fit_window_sec_ = this->get_parameter("fit_window_sec").as_double();
@@ -51,6 +52,9 @@ public:
     double yaw_deg = this->get_parameter("yaw_correction_deg").as_double();
     yaw_cos_ = std::cos(yaw_deg * M_PI / 180.0);
     yaw_sin_ = std::sin(yaw_deg * M_PI / 180.0);
+    double pitch_deg = this->get_parameter("pitch_correction_deg").as_double();
+    pitch_cos_ = std::cos(pitch_deg * M_PI / 180.0);
+    pitch_sin_ = std::sin(pitch_deg * M_PI / 180.0);
 
     // Subscriber for timestamped LiDAR angle via JointState
     angle_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
@@ -90,8 +94,8 @@ public:
 
     RCLCPP_INFO(this->get_logger(),
       "Pointcloud rotator initialized (linear-fit, window=%.1fs, max_stale=%.0fms, "
-      "rot_axis_y=%.4f, rot_axis_z=%.4f, yaw_correction=%.2f deg)",
-      fit_window_sec_, max_stale_ms_, rot_axis_y_, rot_axis_z_, yaw_deg);
+      "rot_axis_y=%.4f, rot_axis_z=%.4f, yaw=%.2f deg, pitch=%.2f deg)",
+      fit_window_sec_, max_stale_ms_, rot_axis_y_, rot_axis_z_, yaw_deg, pitch_deg);
   }
 
 private:
@@ -255,6 +259,8 @@ private:
 
     float yc = static_cast<float>(yaw_cos_);
     float ys = static_cast<float>(yaw_sin_);
+    float pc = static_cast<float>(pitch_cos_);
+    float ps = static_cast<float>(pitch_sin_);
 
     for (uint32_t i = 0; i < num_points; ++i) {
       uint8_t * point_ptr = data + i * point_step;
@@ -265,16 +271,20 @@ private:
       std::memcpy(&z, point_ptr + z_offset, sizeof(float));
 
       // Step 1: Rz yaw correction in sensor frame (corrects mounting yaw)
-      float x_yc = x * yc - y * ys;
-      float y_yc = x * ys + y * yc;
+      float x1 = x * yc - y * ys;
+      float y1 = x * ys + y * yc;
 
-      // Step 2: Rx rotation around the physical shaft axis
-      float dy = y_yc - ay;
-      float dz = z - az;
+      // Step 2: Ry pitch correction in sensor frame (corrects mounting tilt)
+      float x2 = x1 * pc + z * ps;
+      float z2 = -x1 * ps + z * pc;
+
+      // Step 3: Rx rotation around the physical shaft axis
+      float dy = y1 - ay;
+      float dz = z2 - az;
       float y_new = dy * cos_f - dz * sin_f + ay;
       float z_new = dy * sin_f + dz * cos_f + az;
 
-      std::memcpy(point_ptr + x_offset, &x_yc, sizeof(float));
+      std::memcpy(point_ptr + x_offset, &x2, sizeof(float));
       std::memcpy(point_ptr + y_offset, &y_new, sizeof(float));
       std::memcpy(point_ptr + z_offset, &z_new, sizeof(float));
 
@@ -296,6 +306,8 @@ private:
   double rot_axis_z_;
   double yaw_cos_;
   double yaw_sin_;
+  double pitch_cos_;
+  double pitch_sin_;
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr angle_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
